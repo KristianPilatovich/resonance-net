@@ -1,0 +1,7 @@
+build/
+data/
+checkpoints/
+checkpoints_130m/
+*.bin
+*.o
+*.log
