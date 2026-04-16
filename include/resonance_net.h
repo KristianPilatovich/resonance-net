@@ -6,6 +6,8 @@
 
 namespace rnet {
 
+struct DistState;
+
 struct LayerWeights {
     // 4x RMSNorm
     float* norm1_w;   // pre-conv
@@ -62,8 +64,12 @@ public:
     // Backward pass: from dlogits, compute all gradients
     void backward(const float* d_dlogits, const int* d_tokens, int batch, int seq_len);
 
-    // Update weights with AdamW
+    // Update weights with SGD (all-reduces grads if dist is attached)
     void step(const TrainConfig& tcfg, int step_num);
+
+    // Attach a distributed state so step() performs NCCL all-reduce
+    // on gradients before the SGD update. nullptr disables DDP.
+    void set_dist(DistState* dist) { dist_ = dist; }
 
     // Zero all gradients
     void zero_grad();
@@ -99,10 +105,6 @@ private:
     std::vector<LayerGrads> grads_;
     std::vector<LayerCache> cache_;
 
-    // AdamW states
-    float* d_m_ = nullptr;  // first moment
-    float* d_v_ = nullptr;  // second moment
-
     // Working buffers
     float* d_hidden_ = nullptr;    // [batch, seq, d_model]
     float* d_dhidden_ = nullptr;   // grad for hidden
@@ -117,6 +119,8 @@ private:
     int alloc_bs_ = 0;  // allocated batch*seq size
 
     size_t total_params_ = 0;
+
+    DistState* dist_ = nullptr;
 
     void alloc_layer(int layer_idx);
     void init_weights();

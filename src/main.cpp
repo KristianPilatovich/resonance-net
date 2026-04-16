@@ -1,4 +1,5 @@
 #include "resonance_net.h"
+#include "dist.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,6 +34,9 @@ void print_usage(const char* prog) {
 }
 
 void train(int argc, char** argv) {
+    DistState dist = dist_init_from_env();
+    const bool is_master = dist.is_master();
+
     ModelConfig mcfg;
     TrainConfig tcfg;
     std::string resume_path;
@@ -56,36 +60,42 @@ void train(int argc, char** argv) {
     // Ensure gru_dim matches d_model
     mcfg.gru_dim = mcfg.d_model;
 
-    printf("═══════════════════════════════════════════════════\n");
-    printf("  ResonanceNet V5 Training\n");
-    printf("═══════════════════════════════════════════════════\n");
-    printf("  d_model=%d, layers=%d, d_ff=%d, slots=%d\n",
-           mcfg.d_model, mcfg.n_layers, mcfg.d_ff, mcfg.n_slots);
-    printf("  batch=%d, seq=%d, lr=%.1e, steps=%d\n",
-           tcfg.batch_size, mcfg.seq_len, tcfg.lr, tcfg.max_steps);
-    printf("  estimated params: %.1f M\n", mcfg.param_count() / 1e6);
-    printf("═══════════════════════════════════════════════════\n\n");
+    if (is_master) {
+        printf("═══════════════════════════════════════════════════\n");
+        printf("  ResonanceNet V5 Training\n");
+        printf("═══════════════════════════════════════════════════\n");
+        printf("  d_model=%d, layers=%d, d_ff=%d, slots=%d\n",
+               mcfg.d_model, mcfg.n_layers, mcfg.d_ff, mcfg.n_slots);
+        printf("  batch=%d (per rank), seq=%d, lr=%.1e, steps=%d\n",
+               tcfg.batch_size, mcfg.seq_len, tcfg.lr, tcfg.max_steps);
+        if (dist.active()) {
+            printf("  DDP world_size=%d  effective global batch=%d\n",
+                   dist.world_size, tcfg.batch_size * dist.world_size);
+        }
+        printf("  estimated params: %.1f M\n", mcfg.param_count() / 1e6);
+        printf("═══════════════════════════════════════════════════\n\n");
+    }
 
     // Load data
     DataLoader data;
     if (!tcfg.data_path.empty()) {
-        if (!data.load(tcfg.data_path)) return;
-    } else {
+        if (!data.load(tcfg.data_path)) { dist_destroy(dist); return; }
+    } else if (is_master) {
         printf("No --data specified, using synthetic random data\n\n");
     }
 
     // Init model
     ResonanceNet model;
     if (!resume_path.empty()) {
-        printf("Resuming from %s\n", resume_path.c_str());
+        if (is_master) printf("Resuming from %s\n", resume_path.c_str());
         model.load(resume_path);
-        // Override seq_len from CLI if specified (weights don't depend on it)
-        if (mcfg.seq_len != 256) {  // non-default
+        if (mcfg.seq_len != 256 && is_master) {
             printf("Overriding seq_len: %d → %d\n", model.config().seq_len, mcfg.seq_len);
         }
     } else {
         model.init(mcfg);
     }
+    model.set_dist(&dist);
 
     // Use CLI mcfg.seq_len (may differ from checkpoint)
     int seq_len = mcfg.seq_len;
@@ -106,9 +116,10 @@ void train(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_loss, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dlogits, (size_t)BS * mcfg.vocab_size * sizeof(float)));
 
-    std::mt19937 rng(42);
+    // Per-rank RNG seed so each rank samples a different slice of data.
+    std::mt19937 rng(42u + (uint32_t)dist.rank * 10007u);
 
-    printf("Training started.\n\n");
+    if (is_master) printf("Training started.\n\n");
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -140,8 +151,8 @@ void train(int argc, char** argv) {
         // Optimizer step
         model.step(tcfg, step);
 
-        // Log
-        if (step % tcfg.log_interval == 0 || step == 1) {
+        // Log (master only; loss reported is rank-0 slice — good enough for trend)
+        if ((step % tcfg.log_interval == 0 || step == 1) && is_master) {
             float h_loss;
             CUDA_CHECK(cudaMemcpy(&h_loss, d_loss, sizeof(float),
                                    cudaMemcpyDeviceToHost));
@@ -149,15 +160,16 @@ void train(int argc, char** argv) {
 
             auto t1 = std::chrono::high_resolution_clock::now();
             float elapsed = std::chrono::duration<float>(t1 - t0).count();
-            float tok_per_sec = (float)(step * BS) / elapsed;
+            int world = dist.active() ? dist.world_size : 1;
+            float tok_per_sec = (float)(step * BS * world) / elapsed;
 
             printf("step %6d | loss %.4f | %.0f tok/s | %.1fs\n",
                    step, h_loss, tok_per_sec, elapsed);
             fflush(stdout);
         }
 
-        // Save checkpoint
-        if (step % tcfg.save_interval == 0) {
+        // Save checkpoint (master only — all ranks hold identical weights post-sync)
+        if (step % tcfg.save_interval == 0 && is_master) {
             char path[256];
             snprintf(path, sizeof(path), "%s/step_%07d.bin",
                      tcfg.save_path.c_str(), step);
@@ -173,6 +185,7 @@ void train(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_loss));
     CUDA_CHECK(cudaFree(d_dlogits));
     model.destroy();
+    dist_destroy(dist);
 }
 
 void bench(int argc, char** argv) {

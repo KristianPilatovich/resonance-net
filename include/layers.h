@@ -152,11 +152,4 @@ void cross_entropy_forward(const float* logits, const int* targets,
 void residual_add(float* x, const float* y, int n, cudaStream_t stream);
 void scale_grads(float* grads, float scale, int n, cudaStream_t stream);
 
-// ─── AdamW Optimizer ────────────────────────────────────────────────
-void adamw_step(float* param, const float* grad, float* m, float* v,
-                float lr, float beta1, float beta2, float eps,
-                float weight_decay, int step, int n, cudaStream_t stream);
-void clip_grads(float** grads, int* sizes, int num_tensors,
-                float max_norm, cudaStream_t stream);
-
 } // namespace rnet

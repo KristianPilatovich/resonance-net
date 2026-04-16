@@ -1,4 +1,5 @@
 #include "resonance_net.h"
+#include "dist.h"
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -546,13 +547,43 @@ void ResonanceNet::layer_backward(int l, float* d_dhidden, int batch, int seq_le
     CUDA_CHECK(cudaFree(d_dsub));
 }
 
-// ─── Optimizer Step (AdamW) ─────────────────────────────────────────
+// ─── Optimizer Step (SGD) ───────────────────────────────────────────
 void ResonanceNet::step(const TrainConfig& tcfg, int step_num) {
     // Plain SGD: param += lr * grad (delta accumulation, original ResonanceNet)
     float lr = tcfg.lr;
     int D = cfg_.d_model, V = cfg_.vocab_size, FF = cfg_.d_ff, NS = cfg_.n_slots;
 
     CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
+
+    // DDP: sum gradients across ranks before computing the update.
+    // Batched into a single NCCL group op to amortize launch overhead.
+    if (dist_ && dist_->active()) {
+        auto reduce = [&](float* g, int count) {
+            dist_allreduce_sum(*dist_, g, (size_t)count, stream_);
+        };
+        dist_group_start(*dist_);
+        reduce(d_embed_g_, V * D);
+        reduce(d_output_g_, V * D);
+        reduce(d_final_norm_g_, D);
+        for (int l = 0; l < cfg_.n_layers; l++) {
+            auto& g = grads_[l];
+            reduce(g.norm1_w, D); reduce(g.norm2_w, D);
+            reduce(g.norm3_w, D); reduce(g.norm4_w, D);
+            reduce(g.conv.conv3_w, 3*D); reduce(g.conv.conv7_w, 7*D);
+            reduce(g.conv.conv15_w, 15*D); reduce(g.conv.mix_w, D*D);
+            reduce(g.gru.Wz, D*D); reduce(g.gru.Wh, D*D);
+            reduce(g.gru.bz, D); reduce(g.gru.bh, D);
+            reduce(g.slot.slot_keys, D*NS); reduce(g.slot.slot_values, D*NS);
+            reduce(g.slot.proj_q, D*D); reduce(g.slot.proj_out, D*D);
+            reduce(g.ffn.gate_w, D*FF); reduce(g.ffn.up_w, D*FF);
+            reduce(g.ffn.down_w, FF*D);
+        }
+        dist_group_end(*dist_);
+        // Grads are now SUM across world_size ranks. Averaging is folded
+        // into the effective learning rate below so we don't need a second
+        // kernel pass over every tensor.
+        lr /= (float)dist_->world_size;
+    }
 
     // Gradient clipping: compute global norm, clip if > 1.0
     float grad_norm_sq = 0.0f;
@@ -579,9 +610,14 @@ void ResonanceNet::step(const TrainConfig& tcfg, int step_num) {
         accum_norm(g.ffn.down_w, FF*D);
     }
     float grad_norm = sqrtf(grad_norm_sq);
+    // When DDP is active, grads hold the SUM across ranks. The norm of the
+    // average gradient — which is what the lr-scaled update effectively uses —
+    // is grad_norm / world_size. Clip against that so behaviour matches single-GPU.
+    float world = (dist_ && dist_->active()) ? (float)dist_->world_size : 1.0f;
+    float avg_grad_norm = grad_norm / world;
     float clip = tcfg.grad_clip;
-    if (clip > 0 && grad_norm > clip) {
-        lr *= clip / grad_norm;
+    if (clip > 0 && avg_grad_norm > clip) {
+        lr *= clip / avg_grad_norm;
     }
 
     float neg_lr = -lr;

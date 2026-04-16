@@ -51,10 +51,6 @@ struct ModelConfig {
 
 struct TrainConfig {
     float lr           = 3e-4f;
-    float beta1        = 0.9f;
-    float beta2        = 0.999f;
-    float weight_decay = 0.01f;
-    float eps          = 1e-8f;
     float grad_clip    = 1.0f;
     int batch_size     = 64;
     int max_steps      = 100000;
